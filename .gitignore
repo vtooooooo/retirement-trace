@@ -221,3 +221,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# PensionTrace generated data
+/runtime/
+/web/public/demo-data.json
+/web/dist/
+/web/node_modules/
+/web/test-results/
+/web/playwright-report/

@@ -1,0 +1,85 @@
+name: Verify and publish static demo
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: pensiontrace
+          POSTGRES_PASSWORD: ci-only
+          POSTGRES_DB: pensiontrace_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pensiontrace -d pensiontrace_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: pip install -r requirements.txt
+      - run: ruff check pensiontrace tests && ruff format --check pensiontrace tests && mypy pensiontrace
+      - run: python -m pytest -q
+        env:
+          PT_TEST_POSTGRES_URL: postgresql://pensiontrace:ci-only@localhost:5432/pensiontrace_test
+      - run: python -m pensiontrace migrate && python -m pensiontrace seed && python -m pensiontrace export
+      - run: python -m pensiontrace evaluate > runtime/benchmark.json
+      - working-directory: web
+        run: npm ci && npm run lint && npm run test:unit && npm run build
+      - working-directory: web
+        run: npx playwright install --with-deps chromium && npm test
+      - name: Run authenticated browser workflow
+        run: |
+          set -euo pipefail
+          export DATABASE_URL=sqlite:///runtime/browser.db
+          export PT_ANALYST_TOKEN=browser-analyst PT_SENIOR_TOKEN=browser-senior
+          python -m pensiontrace seed
+          python -m uvicorn pensiontrace.api:app --host 127.0.0.1 &
+          api_pid=$!
+          npm --prefix web run dev -- --host 127.0.0.1 --port 5173 --strictPort &
+          web_pid=$!
+          trap 'kill "$api_pid" "$web_pid" 2>/dev/null || true' EXIT
+          curl --fail --retry 15 --retry-connrefused --retry-delay 1 http://127.0.0.1:8000/health
+          curl --fail --retry 15 --retry-connrefused --retry-delay 1 http://127.0.0.1:5173/
+          PT_E2E_API=1 npm --prefix web test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pensiontrace-pages
+          path: web/dist/
+          if-no-files-found: error
+
+  deploy:
+    needs: verify
+    if: github.ref == 'refs/heads/main' && vars.CLOUDFLARE_PAGES_PROJECT != ''
+    runs-on: ubuntu-latest
+    concurrency:
+      group: pensiontrace-pages
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pensiontrace-pages
+          path: dist
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy dist --project-name=${{ vars.CLOUDFLARE_PAGES_PROJECT }} --branch=main
