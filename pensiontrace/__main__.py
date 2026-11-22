@@ -7,7 +7,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("command", choices=["migrate", "seed", "export", "evaluate"])
 parser.add_argument("--seed", type=int, default=73)
 parser.add_argument("--count", type=int, default=6600)
-parser.add_argument("--output", default="web/public/demo-data.json")
+parser.add_argument("--output", default="runtime/demo-data.json")
 args = parser.parse_args()
 store = Store()
 if args.command == "migrate":

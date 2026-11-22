@@ -229,3 +229,6 @@ __marimo__/
 /web/node_modules/
 /web/test-results/
 /web/playwright-report/
+/web/.wrangler/
+/web/.dev.vars
+/web/.dev.vars.*

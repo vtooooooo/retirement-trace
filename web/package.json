@@ -4,12 +4,12 @@
   "description": "PensionTrace synthetic investigation workspace",
   "scripts": {
     "test": "playwright test",
-    "dev": "vite --mode local-api",
+    "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview --host 0.0.0.0",
     "lint": "eslint .",
-    "test:unit": "node --test unit/*.test.ts"
+    "test:unit": "node --test unit/*.test.ts unit/*.test.js"
   },
   "license": "MIT",
   "type": "module",

@@ -1,10 +1,13 @@
 # API reference
 
-FastAPI exposes interactive documentation at `/docs` and OpenAPI at `/openapi.json`. Except for health, the endpoints below require a role bearer credential.
+FastAPI exposes interactive documentation at `/docs` and OpenAPI at `/openapi.json`. Protected endpoints use a server-side session cookie. In hosted mode, call them through the same-origin Pages Function. It provides its own edge credential to Render.
 
 | Method and path | Result |
 | --- | --- |
-| GET /health | Connectivity to the migrated database |
+| GET /health/live | Process liveness |
+| GET /ready | Database connectivity, migration version, and seed readiness |
+| POST /api/v1/session | Sign in with a demo username and password |
+| DELETE /api/v1/session | Revoke the current session and clear the cookie |
 | GET /api/v1/session | Current tenant, operator role, and display name |
 | GET /api/v1/workspace | Synthetic portfolio, case projections, evidence, and benchmarks |
 | GET /api/v1/participants | Participant search by name or reference with offset and limit |

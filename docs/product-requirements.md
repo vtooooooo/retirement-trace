@@ -13,4 +13,4 @@ Retirement analysts need to distinguish discrepancies in source systems from con
 | Model & Operations | Inspect held-out and simulated benchmark results |
 | Audit & Governance | Reconstruct decisions and export a case report |
 
-Distinct analyst, senior reviewer, benefits administrator, auditor, and system administrator credentials are available in the synthetic local profile. Actions and limitations are documented in the governance guide.
+Separate analyst, senior reviewer, benefits administrator, and auditor accounts are available in the synthetic workspace. Actions and limitations are documented in the governance guide.

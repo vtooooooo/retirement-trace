@@ -44,6 +44,18 @@ DDL = (
 )
 
 
+SESSION_DDL = (
+    """CREATE TABLE IF NOT EXISTS sessions (
+        token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, tenant TEXT NOT NULL REFERENCES tenants(id),
+        role TEXT NOT NULL, fingerprint TEXT NOT NULL, expires BIGINT NOT NULL)""",
+    "CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires)",
+    """CREATE TABLE IF NOT EXISTS request_limits (
+        scope TEXT NOT NULL, subject TEXT NOT NULL, bucket BIGINT NOT NULL,
+        expires BIGINT NOT NULL, hits INTEGER NOT NULL, PRIMARY KEY (scope,subject,bucket))""",
+    "CREATE INDEX IF NOT EXISTS request_limits_expiry ON request_limits(expires)",
+)
+
+
 def pack(value):
     return json.dumps(value, separators=(",", ":"), sort_keys=True)
 
@@ -60,7 +72,8 @@ class Store:
             import psycopg
             from psycopg.rows import dict_row
 
-            conn = psycopg.connect(self.url, row_factory=dict_row)
+            sslmode = "require" if os.getenv("PT_HOSTED") == "1" else "prefer"
+            conn = psycopg.connect(self.url, row_factory=dict_row, connect_timeout=5, sslmode=sslmode)
         else:
             path = Path(self.url.removeprefix("sqlite:///"))
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -88,9 +101,17 @@ class Store:
 
     def migrate(self):
         with self.transaction() as conn:
-            for statement in DDL:
-                self.sql(conn, statement)
-            self.sql(conn, "INSERT INTO schema_versions VALUES (1) ON CONFLICT DO NOTHING")
+            if self.pg:
+                self.sql(conn, "SELECT pg_advisory_xact_lock(621946190)")
+            else:
+                self.sql(conn, "BEGIN IMMEDIATE")
+            self.sql(conn, DDL[0])
+            for version, statements in ((1, DDL[1:]), (2, SESSION_DDL)):
+                if self.sql(conn, "SELECT version FROM schema_versions WHERE version=?", version).fetchone():
+                    continue
+                for statement in statements:
+                    self.sql(conn, statement)
+                self.sql(conn, "INSERT INTO schema_versions VALUES (?)", version)
 
     def seed(self, seed=73, count=6600, tenant="demo"):
         self.migrate()
@@ -239,9 +260,14 @@ class Store:
                 FROM events WHERE tenant=? AND kind='approve_identity'""",
                 tenant,
             ).fetchone()["n"]
+        by_person: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in evidence.values():
+            if row["person"]:
+                by_person[row["person"]].append(row)
         for c in selected:
-            refs = set(c["alert"]["supporting"])
-            rows = [r for r in evidence.values() if r["person"] == c["person"] or r["id"] in refs]
+            rows_by_id = {r["id"]: r for r in by_person[c["person"]]}
+            rows_by_id.update({ref: evidence[ref] for ref in c["alert"]["supporting"]})
+            rows = [rows_by_id[ref] for ref in sorted(rows_by_id)]
             c["actions"] = rank(c["alert"], rows)
             c["evidence"] = [r["id"] for r in rows]
             c["timeline"] = events[c["id"]]

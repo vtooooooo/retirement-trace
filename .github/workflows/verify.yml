@@ -1,10 +1,15 @@
-name: Verify and publish static demo
+name: Verify and deploy PensionTrace
 
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, feature/pensiontrace]
   workflow_dispatch:
+    inputs:
+      deploy:
+        description: Deploy the selected revision to the production Pages branch
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -40,26 +45,28 @@ jobs:
       - run: python -m pytest -q
         env:
           PT_TEST_POSTGRES_URL: postgresql://pensiontrace:ci-only@localhost:5432/pensiontrace_test
-      - run: python -m pensiontrace migrate && python -m pensiontrace seed && python -m pensiontrace export
-      - run: python -m pensiontrace evaluate > runtime/benchmark.json
-      - working-directory: web
-        run: npm ci && npm run lint && npm run test:unit && npm run build
-      - working-directory: web
-        run: npx playwright install --with-deps chromium && npm test
-      - name: Run authenticated browser workflow
+      - name: Create isolated browser database
         run: |
-          set -euo pipefail
-          export DATABASE_URL=sqlite:///runtime/browser.db
-          export PT_ANALYST_TOKEN=browser-analyst PT_SENIOR_TOKEN=browser-senior
-          python -m pensiontrace seed
-          python -m uvicorn pensiontrace.api:app --host 127.0.0.1 &
-          api_pid=$!
-          npm --prefix web run dev -- --host 127.0.0.1 --port 5173 --strictPort &
-          web_pid=$!
-          trap 'kill "$api_pid" "$web_pid" 2>/dev/null || true' EXIT
-          curl --fail --retry 15 --retry-connrefused --retry-delay 1 http://127.0.0.1:8000/health
-          curl --fail --retry 15 --retry-connrefused --retry-delay 1 http://127.0.0.1:5173/
-          PT_E2E_API=1 npm --prefix web test
+          python - <<'PY'
+          import psycopg
+          with psycopg.connect(
+              "postgresql://pensiontrace:ci-only@localhost:5432/postgres", autocommit=True
+          ) as conn:
+              conn.execute("CREATE DATABASE pensiontrace_browser")
+          PY
+      - working-directory: web
+        env:
+          VITE_API_BASE: /api/v1
+        run: npm ci && npm run lint && npm run test:unit && npm run build && test ! -f dist/demo-data.json
+      - working-directory: web
+        env:
+          WRANGLER_SEND_METRICS: "false"
+        run: npx --yes wrangler@4.166.0 pages functions build functions --outfile "$RUNNER_TEMP/pensiontrace-worker.mjs"
+      - working-directory: web
+        run: npx playwright install --with-deps chromium
+      - run: scripts/verify-browser.sh
+        env:
+          PT_BROWSER_DATABASE_URL: postgresql://pensiontrace:ci-only@localhost:5432/pensiontrace_browser
       - uses: actions/upload-artifact@v4
         with:
           name: pensiontrace-pages
@@ -68,18 +75,75 @@ jobs:
 
   deploy:
     needs: verify
-    if: github.ref == 'refs/heads/main' && vars.CLOUDFLARE_PAGES_PROJECT != ''
+    if: >-
+      vars.CLOUDFLARE_PAGES_PROJECT != '' &&
+      (github.ref == 'refs/heads/main' ||
+      (github.ref == 'refs/heads/feature/pensiontrace' &&
+      ((github.event_name == 'workflow_dispatch' && inputs.deploy) ||
+      (github.event_name == 'push' && vars.PT_ENABLE_FEATURE_DEPLOY == '1'))))
     runs-on: ubuntu-latest
+    environment: production
     concurrency:
-      group: pensiontrace-pages
+      group: pensiontrace-production
       cancel-in-progress: false
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Deploy and verify the Render revision
+        env:
+          PUBLIC_API: ${{ vars.PT_E2E_API_URL }}
+          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+          PAGES_PROJECT: ${{ vars.CLOUDFLARE_PAGES_PROJECT }}
+        run: |
+          [[ "$PUBLIC_API" == https://* && "$RENDER_DEPLOY_HOOK" == https://api.render.com/deploy/* ]]
+          [[ "$PAGES_PROJECT" =~ ^[a-z0-9][a-z0-9-]*$ ]]
+          headers=$(mktemp)
+          trap 'rm -f "$headers"' EXIT
+          ready() {
+            curl --fail --silent --max-time 15 --dump-header "$headers" --output /dev/null "$PUBLIC_API/ready" &&
+              grep -iqx "x-pensiontrace-revision: $GITHUB_SHA" <(tr -d '\r' < "$headers")
+          }
+          if ready; then exit 0; fi
+          # Suppress provider response details, which can include account metadata.
+          if ! curl --fail --silent --max-time 30 --output /dev/null "$RENDER_DEPLOY_HOOK"; then
+            echo "Render deploy hook failed."
+            exit 1
+          fi
+          for attempt in {1..30}; do
+            if ready; then exit 0; fi
+            sleep 10
+          done
+          echo "Render readiness did not report the selected commit. Check the configured Render branch and deploy logs."
+          exit 1
       - uses: actions/download-artifact@v4
         with:
           name: pensiontrace-pages
-          path: dist
+          path: web/dist
       - uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy dist --project-name=${{ vars.CLOUDFLARE_PAGES_PROJECT }} --branch=main
+          wranglerVersion: '4.166.0'
+          workingDirectory: web
+          command: pages deploy dist --project-name=${{ vars.CLOUDFLARE_PAGES_PROJECT }} --branch=main --commit-hash=${{ github.sha }}
+      - working-directory: web
+        run: npm ci && npx playwright install --with-deps chromium
+      - name: Verify public frontend and backend with Playwright
+        working-directory: web
+        env:
+          PT_E2E_FRONTEND_URL: ${{ vars.PT_E2E_FRONTEND_URL }}
+          PT_E2E_API_URL: ${{ vars.PT_E2E_API_URL }}
+          PT_E2E_QA_WRITE: ${{ vars.PT_E2E_QA_WRITE }}
+          PT_E2E_ANALYST_USER: ${{ secrets.PT_E2E_ANALYST_USER }}
+          PT_E2E_ANALYST_PASSWORD: ${{ secrets.PT_E2E_ANALYST_PASSWORD }}
+          PT_E2E_SENIOR_USER: ${{ secrets.PT_E2E_SENIOR_USER }}
+          PT_E2E_SENIOR_PASSWORD: ${{ secrets.PT_E2E_SENIOR_PASSWORD }}
+          PT_E2E_BENEFITS_USER: ${{ secrets.PT_E2E_BENEFITS_USER }}
+          PT_E2E_BENEFITS_PASSWORD: ${{ secrets.PT_E2E_BENEFITS_PASSWORD }}
+          PT_E2E_AUDITOR_USER: ${{ secrets.PT_E2E_AUDITOR_USER }}
+          PT_E2E_AUDITOR_PASSWORD: ${{ secrets.PT_E2E_AUDITOR_PASSWORD }}
+        run: |
+          [[ "$PT_E2E_FRONTEND_URL" == https://* && "$PT_E2E_API_URL" == https://* ]]
+          npm test -- --grep-invert "backend process restart"

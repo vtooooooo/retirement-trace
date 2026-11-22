@@ -7,14 +7,13 @@ flowchart LR
     S --> I[Features, rules, and scoring]
     L --> V[Fit, calibration, and held-out evaluation]
     I --> V
-    V --> D[(PostgreSQL or SQLite)]
+    V --> D[(Managed PostgreSQL)]
     I --> D
-    D --> A[FastAPI v1]
-    A --> W[Authenticated React workspace]
-    D --> E[Pristine synthetic export]
-    E --> P[Static React Pages artifact]
+    W[React on Cloudflare Pages] --> F[Same-origin Pages Function]
+    F -->|HTTPS with edge credential| A[FastAPI on Render]
+    A <-->|Cases, sessions, rate limits| D
 ```
 
-Python builds the source dataset, candidate pairs, discrepancy cases, and benchmark report. The repository uses small explicit SQL migrations through psycopg or SQLite and a FastAPI interface. Decision requests use a case revision, authorized role, and idempotency key. Case updates and audit events commit in the same transaction. An evidence projection joins source record references, candidate pairs, and decisions by tenant and case.
+Python builds the source dataset, candidate pairs, discrepancy cases, and benchmark report. Versioned initialization is transactional and idempotent. A separate SQLite profile supports local iteration. Decision requests use a case revision, authorized account, and idempotency key. Case updates and audit events commit together.
 
-The Vite build bundles a React and TypeScript SPA with a self-contained synthetic data asset. The local developer build can use the authenticated API through a same-origin Vite proxy. The static artifact carries no operational database or credentials.
+The Pages artifact contains UI assets only. The browser restores sessions from the authenticated API, searches the active tenant's PostgreSQL data, and uses server-generated audit exports. The Pages Function injects its Render origin and secret at runtime. Cookies are issued on the frontend origin.

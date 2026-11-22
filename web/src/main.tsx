@@ -9,7 +9,6 @@ import {
   BookOpen,
   CalendarDays,
   ChartNoAxesCombined,
-  ChevronDown,
   ChevronRight,
   CircleHelp,
   ClipboardList,
@@ -30,6 +29,7 @@ import {
 } from "lucide-react";
 import type { Alert, Case, Counts, Dataset, Evidence, Match } from "./types";
 import { availableDecisions, prioritize, type Role } from "./workflow";
+import { api, ApiError, post, type Participant, type Session } from "./api";
 import "./style.css";
 
 const nav = [
@@ -787,16 +787,16 @@ function Workflow({
   current,
   data,
   go,
-  token,
   role,
   reload,
+  expired,
 }: {
   current: Case;
   data: Dataset;
   go: (p: Page) => void;
-  token: string;
   role?: Role;
   reload: () => Promise<void>;
+  expired: () => void;
 }) {
   const [action, setAction] = useState("");
   const [note, setNote] = useState("");
@@ -824,33 +824,24 @@ function Workflow({
     setBusy(true);
     setResult("");
     try {
-      const r = await fetch("/api/v1/cases/" + current.id + "/decisions", {
-        method: "POST",
-        headers: {
-          Authorization: "Bearer " + token,
-          "Content-Type": "application/json",
-          "Idempotency-Key": crypto.randomUUID(),
-        },
-        body: JSON.stringify({
-          action: selected,
-          note,
-          version: current.version,
-          reference: reference || null,
-        }),
-      });
-      if (!r.ok) {
-        const body = await r.json();
-        throw new Error(
-          typeof body.detail === "string"
-            ? body.detail
-            : "Check the required decision fields.",
-        );
-      }
+      await api(
+        "/cases/" + current.id + "/decisions",
+        post(
+          {
+            action: selected,
+            note,
+            version: current.version,
+            reference: reference || null,
+          },
+          { "Idempotency-Key": crypto.randomUUID() },
+        ),
+      );
       await reload();
       setResult("Decision recorded in the audit trail.");
       setNote("");
       setReference("");
     } catch (error) {
+      if (error instanceof ApiError && error.status === 401) expired();
       setResult((error as Error).message);
     } finally {
       setBusy(false);
@@ -889,12 +880,7 @@ function Workflow({
           </div>
           <div>
             <h3>Record a decision</h3>
-            {!token ? (
-              <p className="read-only">
-                <LockKeyhole size={16} /> Decision recording is disabled in this
-                read-only demo.
-              </p>
-            ) : !options.length ? (
+            {!options.length ? (
               <p className="read-only">
                 <LockKeyhole size={16} /> This role has no available decisions
                 in the current state.
@@ -1086,29 +1072,24 @@ function Analytics({ data }: { data: Dataset }) {
   );
 }
 function Audit({ current, data }: { current: Case; data: Dataset }) {
-  function download() {
-    const matches = data.matches.filter((m) => m.person === current.person);
-    const refs = new Set([
-      ...current.evidence,
-      ...matches.flatMap((m) => [m.left, m.right]),
-    ]);
-    const report = {
-      case: current,
-      matches,
-      evidence: [...refs].map((ref) => data.evidence[ref]),
-      system: { version: data.version, as_of: data.as_of, synthetic: true },
-    };
-    const url = URL.createObjectURL(
-      new Blob([JSON.stringify(report, null, 2)], { type: "application/json" }),
-    );
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = current.id + "-synthetic-audit.json";
-    link.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  const [failure, setFailure] = useState("");
+  async function download() {
+    setFailure("");
+    try {
+      const response = await api("/cases/" + current.id + "/audit");
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = current.id + "-audit.json";
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) {
+      setFailure((error as Error).message);
+    }
   }
   return (
     <div className="stack">
+      {failure && <p role="alert">{failure}</p>}
       <Panel
         title="Case audit trail"
         subtitle={current.id + " · " + current.name}
@@ -1232,49 +1213,108 @@ function App() {
   const [page, setPage] = useState<Page>(initialPage);
   const [data, setData] = useState<Dataset>();
   const [failure, setFailure] = useState("");
-  const [caseId, setCaseId] = useState("");
+  const [caseId, setCaseId] = useState(
+    () => sessionStorage.getItem("pt.selectedCase") || "",
+  );
   const [query, setQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const [status, setStatus] = useState("");
   const [mobile, setMobile] = useState(false);
   const [guide, setGuide] = useState(-1);
-  const [login, setLogin] = useState(false);
-  const [token, setToken] = useState("");
-  const [role, setRole] = useState<Role>();
-  const [draftToken, setDraftToken] = useState("");
+  const [identity, setIdentity] = useState<Session>();
+  const [checking, setChecking] = useState(true);
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [participants, setParticipants] = useState<Participant[]>([]);
+  const [participant, setParticipant] = useState<Participant>();
+  const [searchFailure, setSearchFailure] = useState("");
   const [limit, setLimit] = useState(20);
   const search = useRef<HTMLInputElement>(null);
-  const live = import.meta.env.MODE === "local-api";
-  async function load(value = token) {
-    const res = await fetch(
-      value ? "/api/v1/workspace" : "./demo-data.json",
-      value ? { headers: { Authorization: "Bearer " + value } } : undefined,
-    );
-    if (!res.ok)
-      throw new Error(
-        value
-          ? "Workspace access failed. Check the local API and credential."
-          : "The synthetic dataset could not be loaded.",
-      );
-    setData(await res.json());
-    setFailure("");
+
+  function clearSession() {
+    setIdentity(undefined);
+    setData(undefined);
+    setParticipant(undefined);
+    setParticipants([]);
+    setCaseId("");
+    setQuery("");
   }
-  async function connect(value: string) {
-    const response = await fetch("/api/v1/session", {
-      headers: { Authorization: "Bearer " + value },
-    });
-    if (!response.ok)
-      throw new Error(
-        "Workspace access failed. Check the local API and credential.",
-      );
-    const identity = (await response.json()) as { role: Role };
-    await load(value);
-    setRole(identity.role);
-    setToken(value);
+  async function load() {
+    try {
+      const response = await api("/workspace");
+      setData(await response.json());
+      setFailure("");
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) clearSession();
+      throw error;
+    }
   }
   useEffect(() => {
-    void load("").catch((e) => setFailure(e.message));
+    async function restore() {
+      try {
+        const response = await api("/session");
+        setIdentity(await response.json());
+        await load();
+      } catch (error) {
+        if (!(error instanceof ApiError && error.status === 401)) {
+          setFailure((error as Error).message);
+        }
+      } finally {
+        setChecking(false);
+      }
+    }
+    void restore();
   }, []);
+  useEffect(() => {
+    if (!identity || !searchOpen || query.trim().length < 2) return;
+    const controller = new AbortController();
+    const handle = window.setTimeout(async () => {
+      try {
+        const parameters = new URLSearchParams({ q: query.trim(), limit: "8" });
+        const response = await api("/participants?" + parameters, {
+          signal: controller.signal,
+        });
+        const found = (await response.json()) as Participant[];
+        if (!controller.signal.aborted) setParticipants(found);
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        if (error instanceof ApiError && error.status === 401) clearSession();
+        else setSearchFailure("Participant search is temporarily unavailable.");
+      }
+    }, 250);
+    return () => {
+      window.clearTimeout(handle);
+      controller.abort();
+    };
+  }, [identity, query, searchOpen]);
+  async function signIn(event: React.FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setFailure("");
+    try {
+      const response = await api("/session", post({ username, password }));
+      setIdentity(await response.json());
+      await load();
+    } catch (error) {
+      setFailure((error as Error).message);
+    } finally {
+      setBusy(false);
+      setPassword("");
+    }
+  }
+  async function signOut() {
+    setBusy(true);
+    try {
+      await api("/session", { method: "DELETE" });
+      clearSession();
+      setFailure("");
+    } catch (error) {
+      setFailure((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
   useEffect(() => {
     const sync = () => setPage(initialPage());
     const shortcut = (e: KeyboardEvent) => {
@@ -1284,7 +1324,6 @@ function App() {
       }
       if (e.key === "Escape") {
         setSearchOpen(false);
-        setLogin(false);
         setMobile(false);
       }
     };
@@ -1295,6 +1334,10 @@ function App() {
       removeEventListener("keydown", shortcut);
     };
   }, []);
+  useEffect(() => {
+    if (caseId) sessionStorage.setItem("pt.selectedCase", caseId);
+    else sessionStorage.removeItem("pt.selectedCase");
+  }, [caseId]);
   const current = data?.cases.find((c) => c.id === caseId) ?? data?.cases[0];
   function go(target: Page) {
     setPage(target);
@@ -1304,6 +1347,7 @@ function App() {
   }
   function open(c: Case, target: Page = "cases") {
     setCaseId(c.id);
+    setParticipant(undefined);
     go(target);
     setSearchOpen(false);
     setQuery("");
@@ -1339,6 +1383,57 @@ function App() {
     "audit",
   ].includes(page);
   const currentNav = nav.find((x) => x[0] === page)!;
+
+  if (!identity) {
+    return (
+      <main className="signin-page">
+        <section className="panel signin-panel" aria-labelledby="signin-title">
+          <span className="brand-icon">
+            <ScanLine size={23} />
+          </span>
+          <h1 id="signin-title">PensionTrace AI</h1>
+          <p className="muted">
+            Sign in to the synthetic retirement operations workspace.
+          </p>
+          {checking ? (
+            <p role="status">Checking session…</p>
+          ) : (
+            <form className="form" onSubmit={signIn}>
+              <label className="field">
+                Username
+                <input
+                  autoComplete="username"
+                  maxLength={64}
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  required
+                />
+              </label>
+              <label className="field">
+                Password
+                <input
+                  type="password"
+                  autoComplete="current-password"
+                  maxLength={256}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  required
+                />
+              </label>
+              <button className="button primary" disabled={busy}>
+                {busy ? "Signing in…" : "Sign in"}
+              </button>
+            </form>
+          )}
+          {failure && (
+            <p role="alert" className="error">
+              {failure}
+            </p>
+          )}
+        </section>
+      </main>
+    );
+  }
 
   return (
     <div className="app">
@@ -1394,22 +1489,34 @@ function App() {
             <BookOpen size={17} /> Demo walkthrough <ChevronRight size={15} />
           </button>
           <div className="profile">
-            <div className="avatar">{token ? "LO" : "RV"}</div>
+            <div className="avatar">
+              {identity.name
+                .split(" ")
+                .map((part) => part[0])
+                .slice(0, 2)
+                .join("")}
+            </div>
             <div>
-              <strong>{token ? "Local operator" : "Recruiter view"}</strong>
+              <strong>{identity.name}</strong>
               <small>
-                {token ? "Authenticated session" : "Read-only access"}
+                {
+                  {
+                    analyst: "Analyst",
+                    senior: "Senior reviewer",
+                    benefits: "Benefits administrator",
+                    auditor: "Auditor",
+                    admin: "Administrator",
+                  }[identity.role]
+                }
               </small>
             </div>
-            {live && (
-              <button
-                aria-label="Connect local API"
-                className="icon-btn"
-                onClick={() => setLogin(!login)}
-              >
-                <ChevronDown size={16} />
-              </button>
-            )}
+            <button
+              className="signout"
+              disabled={busy}
+              onClick={() => void signOut()}
+            >
+              Sign out
+            </button>
           </div>
         </div>
       </aside>
@@ -1434,9 +1541,12 @@ function App() {
                 ref={search}
                 aria-label="Search cases and participants"
                 placeholder="Search cases, participants…"
+                maxLength={100}
                 value={query}
                 onFocus={() => setSearchOpen(true)}
                 onChange={(e) => {
+                  setSearchFailure("");
+                  setParticipants([]);
                   setQuery(e.target.value);
                   setSearchOpen(true);
                 }}
@@ -1452,9 +1562,38 @@ function App() {
                       <small>{c.alert.title}</small>
                     </button>
                   ))}
-                  {!results.length && (
-                    <p>No matching cases or participants in this workspace.</p>
-                  )}
+                  {participants
+                    .filter(
+                      (p) =>
+                        !results.slice(0, 8).some((c) => c.id === p.case_id),
+                    )
+                    .map((p) => (
+                      <button
+                        key={p.id}
+                        onClick={() => {
+                          const linked = data?.cases.find(
+                            (c) => c.id === p.case_id,
+                          );
+                          if (linked) open(linked);
+                          else {
+                            setParticipant(p);
+                            setSearchOpen(false);
+                            setQuery("");
+                          }
+                        }}
+                      >
+                        <strong>
+                          {p.name} · {p.id}
+                        </strong>
+                        <small>Synthetic participant</small>
+                      </button>
+                    ))}
+                  {searchFailure && <p role="status">{searchFailure}</p>}
+                  {!results.length &&
+                    !participants.length &&
+                    !searchFailure && (
+                      <p>No matching cases or participants yet.</p>
+                    )}
                 </div>
               )}
             </div>
@@ -1514,9 +1653,9 @@ function App() {
               <p>{descriptions[page][1]}</p>
             </div>
             <div className="heading-actions">
-              <Badge tone={token ? "green" : "violet"}>
+              <Badge tone="green">
                 <LockKeyhole size={13} />
-                {token ? "Local API" : "Synthetic demo"}
+                Live synthetic workspace
               </Badge>
               {data && (
                 <span className="date">
@@ -1526,45 +1665,24 @@ function App() {
               )}
             </div>
           </div>
-          {login && live && (
-            <form
-              className="connect row wrap"
-              onSubmit={async (e) => {
-                e.preventDefault();
-                try {
-                  await connect(draftToken);
-                  setLogin(false);
-                  setDraftToken("");
-                } catch (error) {
-                  setFailure((error as Error).message);
-                }
-              }}
-            >
-              <label className="field">
-                Local API credential
-                <input
-                  type="password"
-                  value={draftToken}
-                  onChange={(e) => setDraftToken(e.target.value)}
-                  required
-                />
-              </label>
-              <button className="button primary">Connect</button>
-              {token && (
+          {participant && (
+            <Panel
+              title={participant.name}
+              subtitle={participant.id + " · Synthetic participant"}
+              side={
                 <button
-                  type="button"
-                  className="button secondary"
-                  onClick={async () => {
-                    await load("");
-                    setToken("");
-                    setRole(undefined);
-                    setLogin(false);
-                  }}
+                  className="icon-btn"
+                  aria-label="Close participant"
+                  onClick={() => setParticipant(undefined)}
                 >
-                  Disconnect
+                  <X size={16} />
                 </button>
-              )}
-            </form>
+              }
+            >
+              <p className="content">
+                No investigation case is linked to this participant.
+              </p>
+            </Panel>
           )}
           {failure && (
             <div className="error" role="alert">
@@ -1640,8 +1758,8 @@ function App() {
                     current={current}
                     data={data}
                     go={go}
-                    token={token}
-                    role={role}
+                    role={identity.role}
+                    expired={clearSession}
                     reload={() => load()}
                   />
                   <Panel
