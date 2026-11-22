@@ -31,6 +31,10 @@ PASSWORD_HASH = re.compile(r"scrypt:[a-f0-9]{32}:[a-f0-9]{64}")
 router = APIRouter(prefix="/api/v1/session")
 
 
+class HostingConfigurationError(RuntimeError):
+    """A configuration error whose message is safe to show in startup logs."""
+
+
 class Identity(NamedTuple):
     tenant: str
     role: str
@@ -97,32 +101,74 @@ def accounts():
             ):
                 raise ValueError()
             result[username] = Account(Identity(tenant, role, ROLES[role], username), hashed)
-    except (TypeError, ValueError, KeyError, AttributeError) as exc:
-        raise RuntimeError("Invalid PT_DEMO_ACCOUNTS configuration") from exc
+    except (TypeError, ValueError, KeyError, AttributeError):
+        raise HostingConfigurationError("PT_DEMO_ACCOUNTS is invalid.") from None
     return result
+
+
+def is_https_origin(origin: str) -> bool:
+    try:
+        url = urlsplit(origin)
+        port = url.port
+    except ValueError:
+        return False
+    return (
+        url.scheme == "https"
+        and bool(url.hostname)
+        and url.username is None
+        and (port is None or port > 0)
+        and origin == f"https://{url.netloc}"
+        and not any(char.isspace() or char in "*\\%" or ord(char) < 32 for char in origin)
+    )
 
 
 def validate_hosting(store: Store):
     configured = accounts()
-    if hosted():
-        allowed = origins()
-        if not (
-            store.pg
-            and len(os.getenv("PT_EDGE_SECRET", "")) >= 32
-            and allowed
-            and all(
-                (url := urlsplit(origin)).scheme == "https"
-                and bool(url.hostname)
-                and origin == f"https://{url.netloc}"
-                and not url.username
-                and "*" not in url.netloc
-                for origin in allowed
+    if not hosted():
+        return configured
+
+    from psycopg import ProgrammingError
+    from psycopg.conninfo import conninfo_to_dict
+
+    errors = []
+    if not os.getenv("DATABASE_URL", "").strip():
+        errors.append("DATABASE_URL is missing.")
+    elif not store.pg:
+        errors.append("DATABASE_URL must be a PostgreSQL URI beginning with postgresql:// or postgres://.")
+    else:
+        try:
+            connection = conninfo_to_dict(store.url)
+        except ProgrammingError:
+            errors.append(
+                "DATABASE_URL is not a valid PostgreSQL URI. Copy the full connection URL from Neon."
             )
-            and {a.identity.role for a in configured.values() if a.identity.tenant == "demo"} == set(ROLES)
-        ):
-            raise RuntimeError(
-                "Hosted mode requires PostgreSQL, an edge secret, HTTPS origins, and four demo roles"
-            )
+        else:
+            if not connection.get("host"):
+                errors.append("DATABASE_URL must specify a PostgreSQL server hostname.")
+
+    edge_secret = os.getenv("PT_EDGE_SECRET", "")
+    if not edge_secret.strip():
+        errors.append("PT_EDGE_SECRET is missing.")
+    elif len(edge_secret) < 32:
+        errors.append("PT_EDGE_SECRET must contain at least 32 characters.")
+
+    allowed = origins()
+    if not allowed:
+        errors.append("PT_FRONTEND_ORIGINS is missing.")
+    elif not all(map(is_https_origin, allowed)):
+        errors.append(
+            "PT_FRONTEND_ORIGINS must contain exact HTTPS origins without paths or trailing slashes."
+        )
+
+    missing_roles = ROLES.keys() - {
+        a.identity.role for a in configured.values() if a.identity.tenant == "demo"
+    }
+    if missing_roles:
+        errors.append(
+            "PT_DEMO_ACCOUNTS is missing roles in the demo tenant: " + ", ".join(sorted(missing_roles)) + "."
+        )
+    if errors:
+        raise HostingConfigurationError("Hosted configuration invalid. " + " ".join(errors))
     return configured
 
 

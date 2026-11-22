@@ -4,7 +4,7 @@ import argparse
 import getpass
 import time
 
-from .auth import hash_password, validate_hosting
+from .auth import HostingConfigurationError, hash_password, validate_hosting
 from .db import Store
 
 
@@ -19,7 +19,10 @@ def main():
         print(hash_password(first))
         return
     store = Store()
-    config = validate_hosting(store)
+    try:
+        config = validate_hosting(store)
+    except HostingConfigurationError as exc:
+        parser.exit(1, f"{exc}\n")
     tenants = sorted({"demo", *(account.identity.tenant for account in config.values())})
     for attempt in range(3):
         try:
