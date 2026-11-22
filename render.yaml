@@ -4,10 +4,10 @@ services:
     runtime: python
     branch: feature/pensiontrace
     region: oregon
-    plan: starter
+    plan: free
     buildCommand: pip install --disable-pip-version-check -r requirements.txt
-    startCommand: python -m pensiontrace.hosting initialize && exec uvicorn pensiontrace.api:app --host 0.0.0.0 --port "$PORT"
-    healthCheckPath: /ready
+    startCommand: python -m pensiontrace.hosting initialize && exec uvicorn pensiontrace.api:app --host 0.0.0.0 --port "$PORT" --workers 1 --limit-concurrency 12 --timeout-keep-alive 5
+    healthCheckPath: /health/live
     autoDeployTrigger: "off"
     envVars:
       - key: PYTHON_VERSION
@@ -21,11 +21,4 @@ services:
       - key: PT_DEMO_ACCOUNTS
         sync: false
       - key: DATABASE_URL
-        fromDatabase:
-          name: pensiontrace-db
-          property: connectionString
-databases:
-  - name: pensiontrace-db
-    region: oregon
-    plan: basic-256mb
-    ipAllowList: []
+        sync: false

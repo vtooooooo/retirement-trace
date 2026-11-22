@@ -9,6 +9,7 @@ import secrets
 import time
 from dataclasses import dataclass
 from ipaddress import ip_address
+from threading import BoundedSemaphore
 from typing import Annotated, NamedTuple
 from urllib.parse import urlsplit
 
@@ -24,6 +25,7 @@ ROLES = {
     "auditor": "Audit reviewer",
 }
 SESSION_SECONDS = 8 * 3600
+PASSWORD_CHECKS = BoundedSemaphore(2)
 USERNAME = re.compile(r"[a-z0-9][a-z0-9._-]{2,63}")
 PASSWORD_HASH = re.compile(r"scrypt:[a-f0-9]{32}:[a-f0-9]{64}")
 router = APIRouter(prefix="/api/v1/session")
@@ -200,7 +202,12 @@ def login(body: Login, request: Request, response: Response):
     account = accounts().get(username)
     stored = account.password_hash if account else f"scrypt:{'0' * 32}:{'0' * 64}"
     _, salt, expected = stored.split(":")
-    valid = hmac.compare_digest(scrypt(body.password, bytes.fromhex(salt)), bytes.fromhex(expected))
+    if not PASSWORD_CHECKS.acquire(timeout=3):
+        raise HTTPException(503, "Sign-in is busy. Try again in a moment.", headers={"Retry-After": "3"})
+    try:
+        valid = hmac.compare_digest(scrypt(body.password, bytes.fromhex(salt)), bytes.fromhex(expected))
+    finally:
+        PASSWORD_CHECKS.release()
     if not account or not valid:
         raise HTTPException(401, "Invalid username or password")
     token = secrets.token_urlsafe(32)

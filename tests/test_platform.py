@@ -8,6 +8,7 @@ from pensiontrace.api import app
 from pensiontrace.auth import ROLES, hash_password
 from pensiontrace.db import Store, pack
 from pensiontrace.engine import candidates, classify, detect, evaluate, features, generate, rank
+from pensiontrace.hosting import initialize
 
 
 @pytest.fixture(scope="module")
@@ -119,6 +120,18 @@ def test_migration_foreign_keys_and_public_export(db):
         for match in data["matches"]:
             if match["person"] == case["person"]:
                 assert {match["left"], match["right"]} <= data["evidence"].keys()
+
+
+def test_initialized_database_skips_seed_and_migrations(db, monkeypatch):
+    before = db.snapshot("demo", 1)
+
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("Startup attempted to change an initialized database")
+
+    monkeypatch.setattr(db, "migrate", unexpected)
+    monkeypatch.setattr(db, "seed", unexpected)
+    initialize(db, ["demo"])
+    assert db.snapshot("demo", 1) == before
 
 
 def test_api_permissions_validation_and_tenant_scope(db, monkeypatch, demo_accounts):

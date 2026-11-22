@@ -17,6 +17,7 @@ test("proxy preserves cookies and original origin against a fixed upstream", asy
     return new Response("{}", {
       headers: {
         "Set-Cookie": "__Host-pt_session=test; Secure; Path=/; HttpOnly",
+        "Content-Type": "application/json",
       },
     });
   });
@@ -68,4 +69,23 @@ test("proxy rejects unknown paths, insecure configuration and oversized bodies",
     413,
   );
   assert.equal(fetch.mock.callCount(), 0);
+});
+
+test("Render HTML wake-up responses stay transient and never replay writes", async (t) => {
+  const fetch = t.mock.method(
+    globalThis,
+    "fetch",
+    async () =>
+      new Response("<html>Waking up</html>", {
+        headers: { "Content-Type": "text/html" },
+      }),
+  );
+  const request = new Request("https://app.example/api/v1/session", {
+    method: "POST",
+    body: "{}",
+  });
+  const result = await onRequest({ request, env });
+  assert.equal(result.status, 503);
+  assert.equal(result.headers.get("retry-after"), "3");
+  assert.equal(fetch.mock.callCount(), 1);
 });

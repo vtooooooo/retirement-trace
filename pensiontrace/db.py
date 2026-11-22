@@ -4,7 +4,7 @@ import json
 import os
 import sqlite3
 from collections import Counter, defaultdict
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +44,9 @@ DDL = (
 )
 
 
+SCHEMA_VERSION = 2
+
+
 SESSION_DDL = (
     """CREATE TABLE IF NOT EXISTS sessions (
         token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, tenant TEXT NOT NULL REFERENCES tenants(id),
@@ -72,8 +75,19 @@ class Store:
             import psycopg
             from psycopg.rows import dict_row
 
-            sslmode = "require" if os.getenv("PT_HOSTED") == "1" else "prefer"
-            conn = psycopg.connect(self.url, row_factory=dict_row, connect_timeout=5, sslmode=sslmode)
+            if os.getenv("PT_HOSTED") == "1":
+                # Explicit options override weaker values in a copied connection URL.
+                conn = psycopg.connect(
+                    self.url,
+                    row_factory=dict_row,
+                    connect_timeout=15,
+                    sslmode="verify-full",
+                    sslrootcert=os.getenv("PT_DATABASE_CA_FILE", "system"),
+                    channel_binding="require",
+                    prepare_threshold=None,
+                )
+            else:
+                conn = psycopg.connect(self.url, row_factory=dict_row, connect_timeout=5)
         else:
             path = Path(self.url.removeprefix("sqlite:///"))
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -92,12 +106,40 @@ class Store:
     def sql(self, conn, query, *params):
         return conn.execute(query.replace("?", "%s") if self.pg else query, params)
 
-    def bulk(self, conn, query, rows):
-        cursor = conn.cursor()
+    def bulk(self, conn, table, columns, rows):
+        # All table names are internal constants. COPY avoids one round trip per row
+        # during the initial synthetic seed against an external connection pooler.
+        with closing(conn.cursor()) as cursor:
+            if self.pg:
+                from psycopg import sql
+
+                with cursor.copy(sql.SQL("COPY {} FROM STDIN").format(sql.Identifier(table))) as writer:
+                    for row in rows:
+                        writer.write_row(row)
+            else:
+                placeholders = ",".join("?" for _ in range(columns))
+                cursor.executemany(f"INSERT INTO {table} VALUES ({placeholders})", rows)
+
+    def initialized(self, tenants):
         try:
-            cursor.executemany(query.replace("?", "%s") if self.pg else query, rows)
-        finally:
-            cursor.close()
+            with self.transaction() as conn:
+                version = self.sql(
+                    conn, "SELECT version FROM schema_versions WHERE version=?", SCHEMA_VERSION
+                )
+                if not version.fetchone():
+                    return False
+                return all(
+                    self.sql(conn, "SELECT 1 FROM benchmarks WHERE tenant=?", tenant).fetchone()
+                    for tenant in tenants
+                )
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc):
+                raise
+        except Exception as exc:
+            # PostgreSQL undefined_table is expected on a fresh database.
+            if getattr(exc, "sqlstate", None) != "42P01":
+                raise
+        return False
 
     def migrate(self):
         with self.transaction() as conn:
@@ -113,8 +155,9 @@ class Store:
                     self.sql(conn, statement)
                 self.sql(conn, "INSERT INTO schema_versions VALUES (?)", version)
 
-    def seed(self, seed=73, count=6600, tenant="demo"):
-        self.migrate()
+    def seed(self, seed=73, count=6600, tenant="demo", *, migrated=False):
+        if not migrated:
+            self.migrate()
         with self.transaction() as conn:
             if not self.sql(conn, "INSERT INTO tenants VALUES (?) ON CONFLICT DO NOTHING", tenant).rowcount:
                 return False
@@ -142,59 +185,43 @@ class Store:
                     k: sum(r["kind"] == k for r in evidence) for k in sorted({r["kind"] for r in evidence})
                 },
             )
-            self.bulk(
-                conn, "INSERT INTO items VALUES (?,?,?)", [(tenant, p["id"], p["name"]) for p in people]
-            )
+            self.bulk(conn, "items", 3, [(tenant, p["id"], p["name"]) for p in people])
             self.bulk(
                 conn,
-                "INSERT INTO evidence VALUES (?,?,?,?,?)",
+                "evidence",
+                5,
                 [(tenant, r["id"], r["person"], r["kind"], pack(r)) for r in evidence],
             )
             self.bulk(
                 conn,
-                "INSERT INTO candidates VALUES (?,?,?,?,?,?)",
+                "candidates",
+                6,
                 [(tenant, m["id"], m["person"], m["left"], m["right"], pack(m)) for m in matches],
             )
             self.bulk(
                 conn,
-                "INSERT INTO alerts VALUES (?,?,?,?)",
+                "alerts",
+                4,
                 [(tenant, a["id"], a["person"], pack(a)) for a in alerts],
             )
+            cases = []
+            events = []
             for i, alert in enumerate(alerts):
                 uid = f"RC-{1042 + i}"
                 state = ("Detected", "Triaged", "Under investigation", "Awaiting evidence")[i % 4]
                 assignee = None if state == "Detected" else ("Maya Chen", "Jon Bell", "Priya Ross")[i % 3]
                 created = f"2026-09-{25 - (i * 7) % 24:02}"
-                self.sql(
-                    conn,
-                    "INSERT INTO cases VALUES (?,?,?,?,?,?,?,?)",
-                    tenant,
-                    uid,
-                    alert["id"],
-                    state,
-                    assignee,
-                    None,
-                    1,
-                    created,
+                cases.append((tenant, uid, alert["id"], state, assignee, None, 1, created))
+                payload = pack(
+                    dict(state=state, note=alert["title"], version=VERSION, evidence=alert["supporting"])
                 )
-                self.sql(
-                    conn,
-                    "INSERT INTO events VALUES (?,?,?,?,?,?,?,?)",
-                    tenant,
-                    uid,
-                    1,
-                    "Synthetic ingestion",
-                    "detected",
-                    created,
-                    "seed",
-                    pack(
-                        dict(state=state, note=alert["title"], version=VERSION, evidence=alert["supporting"])
-                    ),
-                )
+                events.append((tenant, uid, 1, "Synthetic ingestion", "detected", created, "seed", payload))
+            self.bulk(conn, "cases", 8, cases)
+            self.bulk(conn, "events", 8, events)
             self.sql(conn, "INSERT INTO benchmarks VALUES (?,?)", tenant, pack(benchmark))
         return True
 
-    def snapshot(self, tenant, limit=None, *, public=False):
+    def snapshot(self, tenant, limit=None, *, public=False, case_id=None):
         with self.transaction() as conn:
 
             def read(query, *params):
@@ -219,14 +246,21 @@ class Store:
             if public and any(c["version"] != 1 for c in cases):
                 raise ValueError("Public export requires a pristine synthetic database")
             metrics = self.metrics(cases)
-            selected = cases[:limit]
+            selected = [c for c in cases if c["id"] == case_id] if case_id else cases[:limit]
             ids = {c["id"] for c in selected}
             people = {c["person"] for c in selected}
-            matches = [
-                json.loads(r["payload"])
-                for r in read("SELECT payload FROM candidates WHERE tenant=? ORDER BY id")
-            ]
-            matches = [m for m in matches if m["person"] in people]
+
+            def scoped(table, field, values):
+                # Chunk filters for compatibility with SQLite's parameter ceiling.
+                keys = sorted(values)
+                for offset in range(0, len(keys), 400):
+                    chunk = keys[offset : offset + 400]
+                    placeholders = ",".join("?" for _ in chunk)
+                    yield from read(
+                        f"SELECT * FROM {table} WHERE tenant=? AND {field} IN ({placeholders})", *chunk
+                    )
+
+            matches = [json.loads(r["payload"]) for r in scoped("candidates", "person", people)]
             claimed = {ref for c in selected for ref in c["alert"]["conflicting"]}
             matches.sort(
                 key=lambda m: (m["right"] not in claimed, m["status"] != "proposed", -m["score"], m["id"])
@@ -238,19 +272,16 @@ class Store:
             matches = [m for values in top.values() for m in values]
             refs = {ref for m in matches for ref in (m["left"], m["right"])}
             refs.update(ref for c in selected for ref in c["alert"]["supporting"])
-            evidence = {
-                r["id"]: json.loads(r["payload"])
-                for r in read("SELECT * FROM evidence WHERE tenant=? ORDER BY id")
-                if r["person"] in people or r["id"] in refs
-            }
+            evidence = {r["id"]: json.loads(r["payload"]) for r in scoped("evidence", "person", people)}
+            evidence.update(
+                {r["id"]: json.loads(r["payload"]) for r in scoped("evidence", "id", refs - evidence.keys())}
+            )
+            evidence = dict(sorted(evidence.items()))
             events = defaultdict(list)
-            for r in read(
-                "SELECT * FROM events WHERE tenant=? ORDER BY version",
-            ):
-                if r["case_id"] in ids:
-                    events[r["case_id"]].append(
-                        {**{k: r[k] for k in ("actor", "kind", "at", "version")}, **json.loads(r["payload"])}
-                    )
+            for r in sorted(scoped("events", "case_id", ids), key=lambda row: row["version"]):
+                events[r["case_id"]].append(
+                    {**{k: r[k] for k in ("actor", "kind", "at", "version")}, **json.loads(r["payload"])}
+                )
             benchmark = read("SELECT payload FROM benchmarks WHERE tenant=?")
             resolutions = read("SELECT at FROM events WHERE tenant=? AND kind='resolve' ORDER BY at")
             metrics["throughput"] = dict(Counter(row["at"][:7] for row in resolutions))

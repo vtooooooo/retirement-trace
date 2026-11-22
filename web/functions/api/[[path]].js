@@ -10,10 +10,11 @@ const responseHeaders = [
   "content-disposition",
   "retry-after",
   "x-content-type-options",
+  "x-pensiontrace-boot",
 ];
 const BODY_LIMIT = 8 * 1024;
 
-function reply(detail, status) {
+function reply(detail, status, retryAfter) {
   return Response.json(
     { detail },
     {
@@ -21,6 +22,7 @@ function reply(detail, status) {
       headers: {
         "Cache-Control": "no-store",
         "X-Content-Type-Options": "nosniff",
+        ...(retryAfter ? { "Retry-After": retryAfter } : {}),
       },
     },
   );
@@ -89,10 +91,22 @@ export async function onRequest({ request, env }) {
       headers,
       body,
       redirect: "manual",
-      signal: AbortSignal.timeout(20_000),
+      signal: AbortSignal.timeout(75_000),
     });
     if (response.status >= 300 && response.status < 400)
       return reply("Unexpected API redirect", 502);
+    // Render may return an HTML wake-up page, including with HTTP 200.
+    if (
+      response.status !== 204 &&
+      !response.headers.get("content-type")?.includes("application/json")
+    ) {
+      await response.body?.cancel();
+      return reply(
+        "The backend is starting or temporarily unavailable.",
+        503,
+        "3",
+      );
+    }
     const output = new Headers({
       "Cache-Control": "no-store",
       "X-Content-Type-Options": "nosniff",
@@ -114,6 +128,10 @@ export async function onRequest({ request, env }) {
       headers: output,
     });
   } catch {
-    return reply("API temporarily unavailable", 502);
+    return reply(
+      "The backend is starting or temporarily unavailable.",
+      503,
+      "3",
+    );
   }
 }

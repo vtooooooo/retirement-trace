@@ -35,7 +35,7 @@ PY
 source "$scratch/accounts"
 python -m pensiontrace.hosting initialize
 start_api() {
-  python -m uvicorn pensiontrace.api:app --host 127.0.0.1 --port "$api_port" &
+  python -m uvicorn pensiontrace.api:app --host 127.0.0.1 --port "$api_port" --workers 1 --limit-concurrency 12 --timeout-keep-alive 5 &
   api_pid=$!
   curl -fsS --retry 15 --retry-connrefused --retry-delay 1 "$PT_E2E_API_URL/ready"
   kill -0 "$api_pid"

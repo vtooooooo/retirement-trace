@@ -7,6 +7,7 @@ import os
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Annotated, Literal
+from uuid import uuid4
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,6 +29,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="PensionTrace AI", version="1.0", lifespan=lifespan)
 logger = logging.getLogger("pensiontrace.audit")
 app.include_router(auth_router)
+BOOT_ID = uuid4().hex
 
 
 @app.middleware("http")
@@ -110,18 +112,14 @@ def liveness():
 def health(response: Response):
     store = Store()
     try:
-        with store.transaction() as conn:
-            migrated = store.sql(conn, "SELECT version FROM schema_versions WHERE version=2").fetchone()
-            tenants = {"demo"}
-            if hosted():
-                tenants.update(account.identity.tenant for account in validate_hosting(store).values())
-            if not migrated or any(
-                not store.sql(conn, "SELECT 1 FROM benchmarks WHERE tenant=?", tenant).fetchone()
-                for tenant in tenants
-            ):
-                raise RuntimeError("Database initialization is incomplete")
+        tenants = {"demo"}
+        if hosted():
+            tenants.update(account.identity.tenant for account in validate_hosting(store).values())
+        if not store.initialized(tenants):
+            raise RuntimeError("Database initialization is incomplete")
     except Exception as exc:
         raise HTTPException(503, "Database is unavailable or initialization is incomplete") from exc
+    response.headers["X-PensionTrace-Boot"] = BOOT_ID
     revision = os.getenv("RENDER_GIT_COMMIT", "")
     if len(revision) == 40 and all(char in "0123456789abcdef" for char in revision):
         response.headers["X-PensionTrace-Revision"] = revision
@@ -173,7 +171,7 @@ def cases(
 
 
 def find_case(identity, case_id):
-    data = Store().snapshot(identity[0])
+    data = Store().snapshot(identity[0], case_id=case_id)
     for case in data["cases"]:
         if case["id"] == case_id:
             return case, data

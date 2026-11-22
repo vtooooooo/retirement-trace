@@ -1223,6 +1223,7 @@ function App() {
   const [guide, setGuide] = useState(-1);
   const [identity, setIdentity] = useState<Session>();
   const [checking, setChecking] = useState(true);
+  const [connectionAttempt, setConnectionAttempt] = useState(0);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -1252,6 +1253,8 @@ function App() {
   }
   useEffect(() => {
     async function restore() {
+      setChecking(true);
+      setFailure("");
       try {
         const response = await api("/session");
         setIdentity(await response.json());
@@ -1265,7 +1268,7 @@ function App() {
       }
     }
     void restore();
-  }, []);
+  }, [connectionAttempt]);
   useEffect(() => {
     if (!identity || !searchOpen || query.trim().length < 2) return;
     const controller = new AbortController();
@@ -1396,7 +1399,10 @@ function App() {
             Sign in to the synthetic retirement operations workspace.
           </p>
           {checking ? (
-            <p role="status">Checking session…</p>
+            <p role="status">
+              Connecting to the workspace. An idle backend can take a minute to
+              wake up.
+            </p>
           ) : (
             <form className="form" onSubmit={signIn}>
               <label className="field">
@@ -1426,9 +1432,18 @@ function App() {
             </form>
           )}
           {failure && (
-            <p role="alert" className="error">
-              {failure}
-            </p>
+            <div className="row wrap">
+              <p role="alert" className="error">
+                {failure}
+              </p>
+              <button
+                type="button"
+                className="button secondary"
+                onClick={() => setConnectionAttempt((attempt) => attempt + 1)}
+              >
+                Retry connection
+              </button>
+            </div>
           )}
         </section>
       </main>
@@ -1695,7 +1710,12 @@ function App() {
               </button>
             </div>
           )}
-          {!data && !failure && <p role="status">Loading workspace…</p>}
+          {!data && !failure && (
+            <p role="status">
+              Loading workspace. If the backend was idle, this may take a
+              minute.
+            </p>
+          )}
           {data && page === "overview" && (
             <Overview data={data} onCase={open} go={go} />
           )}

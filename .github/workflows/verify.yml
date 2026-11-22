@@ -83,6 +83,7 @@ jobs:
       (github.event_name == 'push' && vars.PT_ENABLE_FEATURE_DEPLOY == '1'))))
     runs-on: ubuntu-latest
     environment: production
+    timeout-minutes: 35
     concurrency:
       group: pensiontrace-production
       cancel-in-progress: false
@@ -91,7 +92,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-      - name: Deploy and verify the Render revision
+      - name: Deploy and verify free Render with Neon
         env:
           PUBLIC_API: ${{ vars.PT_E2E_API_URL }}
           RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
@@ -102,7 +103,7 @@ jobs:
           headers=$(mktemp)
           trap 'rm -f "$headers"' EXIT
           ready() {
-            curl --fail --silent --max-time 15 --dump-header "$headers" --output /dev/null "$PUBLIC_API/ready" &&
+            curl --fail --silent --max-time 85 --dump-header "$headers" --output /dev/null "$PUBLIC_API/ready" &&
               grep -iqx "x-pensiontrace-revision: $GITHUB_SHA" <(tr -d '\r' < "$headers")
           }
           if ready; then exit 0; fi
@@ -111,7 +112,8 @@ jobs:
             echo "Render deploy hook failed."
             exit 1
           fi
-          for attempt in {1..30}; do
+          deadline=$((SECONDS + 420))
+          while (( SECONDS < deadline )); do
             if ready; then exit 0; fi
             sleep 10
           done
@@ -136,6 +138,7 @@ jobs:
           PT_E2E_FRONTEND_URL: ${{ vars.PT_E2E_FRONTEND_URL }}
           PT_E2E_API_URL: ${{ vars.PT_E2E_API_URL }}
           PT_E2E_QA_WRITE: ${{ vars.PT_E2E_QA_WRITE }}
+          PT_VERIFY_FREE_IDLE: ${{ vars.PT_VERIFY_FREE_IDLE }}
           PT_E2E_ANALYST_USER: ${{ secrets.PT_E2E_ANALYST_USER }}
           PT_E2E_ANALYST_PASSWORD: ${{ secrets.PT_E2E_ANALYST_PASSWORD }}
           PT_E2E_SENIOR_USER: ${{ secrets.PT_E2E_SENIOR_USER }}

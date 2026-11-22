@@ -1,19 +1,43 @@
-# Hosted V1.0 deployment
+# Deploy V1.0 on the three free plans
 
-PensionTrace uses Cloudflare Pages for the React frontend and its same-origin API proxy. Render hosts FastAPI and managed PostgreSQL. The production build has no embedded dataset or account credentials. Use the cloud development environment and the hosting dashboards for every step.
+Use **Neon Free PostgreSQL**, **Render Free Web Service**, and **Cloudflare Pages Free**. The commands below run in the Codex cloud terminal inside your browser. Keep all secrets out of chat, Git, and the browser bundle.
 
-## 1. Create the Pages project
+## 1. Create Neon Free PostgreSQL
 
-1. In Cloudflare **Workers & Pages**, create a Pages project for **Direct Upload**. Set its production branch to `main`. GitHub Actions uploads both the built UI and the Pages Function using Wrangler. A dashboard ZIP upload is unnecessary.
-2. Record the exact HTTPS Pages origin, such as `https://pensiontrace-example.pages.dev`. If using a custom domain, add it under **Custom domains** and wait for TLS to activate. Use one canonical origin for GitHub's public tests.
-3. Create a Cloudflare API token scoped to the account with **Cloudflare Pages: Edit**. Record the Cloudflare account ID.
+1. Sign in to [Neon Console](https://console.neon.tech/). Create a project named `pensiontrace` on the **Free** plan. Choose a region near the Render service, preferably US West (Oregon) if available. Keep the default database and branch, such as `neondb` and `production`.
+2. In the project dashboard, click **Connect**. Choose the production database and a role that can create tables and indexes in it. Turn **Connection pooling** on and copy the PostgreSQL URL. It should have an HTTPS-trusted `*.neon.tech` hostname, typically with `-pooler` in the host, and should include the database name and the TLS options Neon provides. The scheme is `postgresql://`. Store the URL in your password manager.
+3. Leave Neon scale-to-zero enabled. There is no database service to create in Render. Keep the Neon project and branch in place across Render redeployments.
 
-## 2. Configure the Render blueprint and accounts
+In hosted mode, psycopg requires TLS certificate and hostname verification with the system CA store and requires SCRAM channel binding. The initial schema and seed use transaction-scoped locks and bulk copies, which are compatible with transaction pooling. Automatic prepared statements are disabled on hosted connections.
 
-1. In Render **Blueprints**, connect this repository and select `feature/pensiontrace` for the initial release. The [blueprint](../render.yaml) creates a Python web service and a managed PostgreSQL database in the same region. The service receives the internal database URL automatically. External database IP access is disabled. Application startup runs the versioned migrations and seeds missing synthetic tenants in a transaction. Existing cases are preserved.
-2. Set `PT_FRONTEND_ORIGINS` to the exact Pages HTTPS origin. Multiple explicitly approved HTTPS origins can be comma-separated. Omit trailing slashes.
-3. Generate at least 32 random bytes for `PT_EDGE_SECRET`, for example with `openssl rand -hex 32` in a private cloud terminal. Put the resulting value in a Render secret and in a Cloudflare Pages **Production** secret with the same name. The Pages Function authenticates to Render with this secret before the API will accept application requests.
-4. Choose distinct usernames and strong unique passwords for the four demo operators. Run `python -m pensiontrace.hosting hash-password` once per password in the project’s Python environment. It prompts without echoing the passwords. Save the JSON array below as the Render secret `PT_DEMO_ACCOUNTS`, replacing each placeholder with the actual generated hash. Keep plaintext passwords in your password manager.
+## 2. Create a Cloudflare Pages Free project
+
+1. In the [Cloudflare dashboard](https://dash.cloudflare.com/), open **Workers & Pages → Create application → Pages → Connect to Git**. Authorize the GitHub repository `vtooooooo/retirement-trace`.
+2. Set a project name and choose `feature/pensiontrace` as the **Production branch**. Use framework preset **None**, **Root directory** `web`, **Build command** `npm run build`, and **Build output directory** `dist`. Add build variable `NODE_VERSION=24`. Select **Save and Deploy**. The frontend can build before the API exists.
+3. Copy the canonical HTTPS Pages origin, such as `https://pensiontrace-example.pages.dev`. Then open the Pages project’s **Settings → Variables and Secrets**. After creating Render in the next section, add these to **Production**:
+
+   | Name | Type | Value |
+   | --- | --- | --- |
+   | `API_ORIGIN` | Text | The exact Render HTTPS origin, without a trailing slash |
+   | `PT_EDGE_SECRET` | Secret | The same random value stored on Render |
+
+The Pages Function is under `web/functions`. The frontend uses `/api/v1` on its own origin, so users never receive the edge secret. If an existing project uses **Direct Upload**, keep it and use the optional GitHub Actions deployment below.
+
+## 3. Create the Render Free Web Service
+
+In the [Render dashboard](https://dashboard.render.com/), choose **New → Blueprint**, connect the repository and select `feature/pensiontrace`. Confirm the preview lists **one Free web service** and no database. If your dashboard does not offer a Free Blueprint service, choose **New → Web Service** instead and apply the settings from [render.yaml](../render.yaml). Use the **Free** instance type, Python runtime, repository root, Oregon region, the feature branch, and Auto Deploy **Off**. Copy the build command, start command, health check path, and Python version from the Blueprint.
+
+In the service’s **Environment** tab, configure:
+
+| Name | Value |
+| --- | --- |
+| `DATABASE_URL` | The pooled PostgreSQL URL copied from Neon. Store it as a Render secret. |
+| `PT_HOSTED` | `1` |
+| `PT_FRONTEND_ORIGINS` | The exact Pages HTTPS origin, with no trailing slash |
+| `PT_EDGE_SECRET` | A server-only random value. Generate it with `openssl rand -hex 32` in a private cloud terminal and save it on both hosts. |
+| `PT_DEMO_ACCOUNTS` | JSON array of distinct accounts and password hashes for the four roles |
+
+To generate each account hash in the browser’s cloud terminal, activate the project Python environment and run `python -m pensiontrace.hosting hash-password`. The prompt does not echo passwords. Save the plaintext passwords privately and put the hashes in Render:
 
 ```json
 [
@@ -24,52 +48,39 @@ PensionTrace uses Cloudflare Pages for the React frontend and its same-origin AP
 ]
 ```
 
-The demo accounts share one persistent synthetic tenant. Distribute each credential privately to its assigned operator. Changing or deleting an account's password hash, role, or tenant invalidates its current sessions. Do not repurpose an existing username for a different person.
+Choose **Save, rebuild, and deploy** or **Manual Deploy → Deploy latest commit**. Copy the service’s `https://…onrender.com` origin into Pages `API_ORIGIN`, set the Pages edge secret, and redeploy the Pages production deployment from its dashboard. The first API start initializes only missing tenants. Existing committed case and audit data in Neon survives restarts. If migrating data from a previously deployed database, restore a verified backup into Neon before pointing the service at it.
 
-5. Record the Render HTTPS origin such as `https://pensiontrace-api-example.onrender.com`. Add it as Cloudflare Pages **Production** variable `API_ORIGIN`, without a trailing slash. In Render service settings, copy the service-specific **Deploy Hook** URL. Treat that entire URL as a secret.
+## 4. Verify the deployment and an idle restart
 
-## 3. Configure GitHub and publish
+1. Open the Render `/ready` URL, then open the Pages `/api/ready` URL. Both must return `{"status":"ok"}`. Render’s routine platform health check uses `/health/live` so that it does not query Neon continuously.
+2. Open the Pages URL in your browser. Sign in, search for a participant, record a synthetic case change as an analyst, and check it with the auditor account. Use separate senior and benefits accounts for approval and resolution. Compare audit history before and after refresh.
+3. To verify natural idle behavior, keep the browser session, close active app tabs without signing out, and wait at least 16 minutes without application requests, health monitors, or deployment jobs. Open the Pages URL again and allow time for the backend to wake. Confirm you can still open the case and see the same audit entry. The optional Playwright scenario records the backend boot ID before and after the wait. If other traffic kept the service awake, it reports that the restart was not observed.
 
-Create a GitHub Actions environment named `production`. Allow deployments from `feature/pensiontrace` for this release, and use an environment reviewer if desired. Set these GitHub Actions values:
-
-| Scope | Name | Value |
-| --- | --- | --- |
-| Repository variable | `CLOUDFLARE_PAGES_PROJECT` | Exact Pages project name |
-| Repository variable, optional | `PT_ENABLE_FEATURE_DEPLOY` | Set to `1` to allow deployments on pushes to `feature/pensiontrace` |
-| Production variable | `PT_E2E_FRONTEND_URL` | Canonical HTTPS Pages origin |
-| Production variable | `PT_E2E_API_URL` | HTTPS Render origin |
-| Production secret | `RENDER_DEPLOY_HOOK` | Render service's deploy hook |
-| Production secrets | `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` | Cloudflare values |
-| Production secrets | `PT_E2E_<ROLE>_USER` and `PT_E2E_<ROLE>_PASSWORD` | One pair each for `ANALYST`, `SENIOR`, `BENEFITS`, and `AUDITOR` |
-
-To deploy before any merge, enable `PT_ENABLE_FEATURE_DEPLOY=1` and run the feature branch push workflow at the latest commit. You can also run a one-time Pages deploy from the existing Codex cloud terminal using Wrangler after setting the secured Cloudflare credential variables there. This uses no local laptop tooling. In the same cloud environment, verify the test and production build first, use the Render dashboard to deploy the latest commit on `feature/pensiontrace`, and confirm that `GET /ready` on Render returns the expected `X-PensionTrace-Revision`. Then run:
+From the project root in the cloud terminal, set `PT_E2E_FRONTEND_URL` and `PT_E2E_API_URL` to the HTTPS origins and set `PT_E2E_<ROLE>_USER` and `PT_E2E_<ROLE>_PASSWORD` for `ANALYST`, `SENIOR`, `BENEFITS`, and `AUDITOR` in secure environment settings. Then run the public smoke suite:
 
 ```sh
-cd web
-npm ci
-VITE_API_BASE=/api/v1 npm run build
-npx --yes wrangler@4.166.0 pages deploy dist --project-name="$CLOUDFLARE_PAGES_PROJECT" --branch=main
+npm --prefix web test -- --grep-invert "backend process restart"
+PT_VERIFY_FREE_IDLE=1 npm --prefix web test -- --grep "hosted free service"
 ```
 
-Set the public test origins and role credentials in your cloud environment's secret settings, then run `npm --prefix web test -- --grep-invert "backend process restart"` from the project root, with Chromium installed in that cloud environment. The E2E suite checks Pages-to-Render readiness, browser sign-in for all four roles, same-origin secure session cookies, participant search, audit export, and auditor restrictions. It defaults to read-only checks against public hosting.
+For a public test that writes workflow decisions automatically, create four additional server-side accounts with distinct usernames and `"tenant":"qa"`. Deploy Render to initialize the QA tenant, point the browser test credentials at those accounts, and set `PT_E2E_QA_WRITE=1`. Automated write tests refuse to modify the ordinary demo tenant.
 
-For public write verification, create four additional server-side accounts with distinct usernames and `"tenant":"qa"`. Set the E2E secrets to those accounts and `PT_E2E_QA_WRITE=1`. The test refuses public writes in the ordinary `demo` tenant. The verification tenant is initialized on the next Render rollout. Its case and audit records persist independently.
+## Optional GitHub Actions deployment
 
-After you approve a merge, switch the Render service branch to `main`. Update `render.yaml` accordingly. The GitHub workflow builds and tests changes on pull requests and pushes. On a deployment run, it triggers Render, waits for the expected revision and database readiness, deploys Pages, then runs browser checks against both public URLs. Keep the Render branch aligned with the revision being deployed. A successful asset upload alone does not establish a working site.
+The repository workflow validates against disposable PostgreSQL and tests a real FastAPI process restart on CI. It can also deploy Render and a **Direct Upload** Pages project. For the browser dashboard Git integration above, leave the repository’s `CLOUDFLARE_PAGES_PROJECT` Actions variable unset and deploy Render from its dashboard. For Direct Upload, create the Pages project with production branch `main` using `npx wrangler@4.166.0 pages project create <name> --production-branch main` from a browser cloud terminal with Cloudflare authentication. GitHub Actions deploys the feature commit into the Pages production branch without merging the Git branch.
 
-## Development and persistence checks
+| Scope | Values |
+| --- | --- |
+| Repository Actions variables | `CLOUDFLARE_PAGES_PROJECT` and `PT_ENABLE_FEATURE_DEPLOY=1` to opt into feature-branch publication |
+| GitHub `production` environment variables | `PT_E2E_FRONTEND_URL`, `PT_E2E_API_URL`, and optionally `PT_E2E_QA_WRITE` or `PT_VERIFY_FREE_IDLE` |
+| GitHub `production` environment secrets | `CLOUDFLARE_API_TOKEN` (Pages Edit), `CLOUDFLARE_ACCOUNT_ID`, `RENDER_DEPLOY_HOOK` from Render service settings, and the four test account credential pairs |
 
-```sh
-python -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-npm --prefix web ci
-cd web && npx playwright install chromium && cd ..
-scripts/verify-browser.sh
-```
+Allow `feature/pensiontrace` to deploy to the `production` environment. The workflow waits for the expected commit’s Render readiness before publishing Pages and running public browser checks. Keep the optional 16-minute idle test off in CI when avoiding runner-minute usage. Run it in the cloud terminal instead.
 
-The verification script generates temporary credentials, tests the four-role workflow, restarts FastAPI, and reuses a browser session to verify the saved case and audit history. It uses an isolated SQLite database by default. To test with PostgreSQL, point `PT_BROWSER_DATABASE_URL` to an empty disposable database. For interactive development, configure your own `PT_DEMO_ACCOUNTS`, run `python -m pensiontrace.hosting initialize`, start Uvicorn on port 8000, and run `npm --prefix web run dev`. Vite proxies same-origin API requests. `PT_FRONTEND_ORIGINS` defaults to the loopback Vite origins in development.
+## Free-tier limits
 
-## Cost and storage
+- Render Free offers 512 MB of RAM, spins down after about 15 minutes without inbound traffic, and shares a monthly free instance-hour quota across the workspace. Wake-up can take about a minute. Its filesystem is ephemeral. Render may suspend free services with unusually high outbound traffic, including traffic to external databases. [Render Free limits](https://render.com/docs/free)
+- Neon Free uses scale-to-zero and has compute, storage, and transfer allowances. Check the **Usage** page in your Neon account. Reaching a quota can interrupt the app. The database persists through idle compute and Render redeployments, while project deletion or exhausted provider quotas can affect access. [Neon plans](https://neon.com/docs/introduction/plans)
+- Pages Free has build and function request limits. The function forwards each API request, and the browser retries eligible reads once after a temporary failure. The app never automatically replays a case mutation. For a $0 budget, stay on all three free plans and keep any GitHub Actions paid overage disabled. [Cloudflare Pages limits](https://developers.cloudflare.com/pages/platform/limits/)
 
-The blueprint selects Render's paid **Starter** web service and **Basic-256mb** managed PostgreSQL. Check the monthly total, storage and backup terms shown by Render before creating resources. Cloudflare Pages has free-tier quotas, and Pages Function requests count toward applicable Workers limits. Render free web services can spin down and have slower first responses. Free PostgreSQL instances expire, and the web service filesystem is ephemeral. Use a persistent managed database for cases and sessions. Review backup and restore guarantees for the selected database plan and test a restore before relying on the dataset. [Render pricing](https://render.com/pricing) · [Pages limits](https://developers.cloudflare.com/pages/platform/limits/)
+A public deployment is verified only after both URLs and the authenticated workflows pass. The local PostgreSQL restart harness does not establish actual Render idle timing or Neon quota behavior.

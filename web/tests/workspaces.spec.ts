@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { readFile, writeFile } from "node:fs/promises";
+import { setTimeout as wait } from "node:timers/promises";
 
 const roles = ["analyst", "senior", "benefits", "auditor"] as const;
 type Role = (typeof roles)[number];
@@ -93,6 +94,25 @@ test("workspaces, database participant search, audit download, reload, and sign-
   page,
   context,
 }) => {
+  if (!process.env.PT_E2E_FRONTEND_URL) {
+    // Simulate the edge's wake-up response while keeping the real API behind it.
+    await page.route(
+      "**/api/v1/session",
+      async (route) => {
+        await route.fulfill({
+          status: 503,
+          json: { detail: "Waking up" },
+          headers: { "Retry-After": "1" },
+        });
+      },
+      { times: 1 },
+    );
+    await page.goto("/");
+    await expect(page.getByRole("status")).toContainText("idle backend");
+    await expect(
+      page.getByRole("button", { name: "Sign in", exact: true }),
+    ).toBeVisible();
+  }
   await signIn(page, "analyst");
   const cookies = await context.cookies();
   const cookie = cookies.find(
@@ -244,7 +264,14 @@ test("four independent accounts complete and audit an identity decision", async 
     if (artifact)
       await writeFile(
         artifact,
-        JSON.stringify({ id, note, storage: await contexts[3].storageState() }),
+        JSON.stringify({
+          id,
+          note,
+          storage: await contexts[3].storageState(),
+          boot: (
+            await auditor.request.get(process.env.PT_E2E_API_URL + "/ready")
+          ).headers()["x-pensiontrace-boot"],
+        }),
         { mode: 0o600 },
       );
   } finally {
@@ -267,9 +294,51 @@ test("persisted session and audit history survive a backend process restart", as
     await expect(
       page.getByText(proof.note, { exact: true }).first(),
     ).toBeVisible();
+    const ready = await page.request.get(process.env.PT_E2E_API_URL + "/ready");
+    const currentBoot = ready.headers()["x-pensiontrace-boot"];
+    expect(currentBoot).toMatch(/^[0-9a-f]{32}$/);
+    expect(proof.boot).toMatch(/^[0-9a-f]{32}$/);
+    expect(currentBoot).not.toBe(proof.boot);
     const result = await page.request.get("/api/v1/cases/" + proof.id);
     expect((await result.json()).case.state).toBe("Resolved");
   } finally {
     await context.close();
   }
+});
+
+test("hosted free service wakes after idle and retains the session and case history", async ({
+  page,
+  context,
+}) => {
+  test.skip(
+    !process.env.PT_E2E_FRONTEND_URL || process.env.PT_VERIFY_FREE_IDLE !== "1",
+    "Opt in after public deployment",
+  );
+  test.setTimeout(21 * 60_000);
+  await signIn(page, "auditor");
+  const first = await page.request.get("/api/ready");
+  expect(first.ok()).toBeTruthy();
+  const boot = first.headers()["x-pensiontrace-boot"];
+  expect(boot).toMatch(/^[a-f0-9]{32}$/);
+  const before = await page.request.get("/api/v1/cases/RC-1042");
+  expect(before.ok()).toBeTruthy();
+  const snapshot = await before.json();
+  await page.close();
+  // No application probes during the free-service idle window.
+  await wait(16 * 60_000);
+  const woken = await context.newPage();
+  await woken.goto("/#cases");
+  await expect(woken.getByRole("button", { name: "Sign out" })).toBeVisible({
+    timeout: 165_000,
+  });
+  const ready = await woken.request.get("/api/ready");
+  expect(ready.ok()).toBeTruthy();
+  expect(ready.headers()["x-pensiontrace-boot"]).toMatch(/^[a-f0-9]{32}$/);
+  expect(
+    ready.headers()["x-pensiontrace-boot"],
+    "Other traffic may have kept Render awake",
+  ).not.toBe(boot);
+  const after = await woken.request.get("/api/v1/cases/RC-1042");
+  expect(after.ok()).toBeTruthy();
+  expect(await after.json()).toEqual(snapshot);
 });
